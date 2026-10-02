@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>ジオフェンシング サンプル</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; font-family: 'Helvetica Neue', Arial, sans-serif; background: #e9ecef; }
+  #map { position: absolute; inset: 0; }
+  .leaflet-bottom.leaflet-right .leaflet-control-zoom { margin-bottom: calc(24px + env(safe-area-inset-bottom)); }
+
+  /* ステータス表示 */
+  #status {
+    position: absolute; z-index: 1000; top: calc(10px + env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
+    width: calc(100% - 32px); max-width: 460px; box-sizing: border-box;
+    background: rgba(255,255,255,0.95); border-radius: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+    padding: 10px 14px; font-size: 14px; line-height: 1.5; color: #333;
+  }
+  #status .state { font-weight: bold; }
+  #status .state.on { color: #1a73e8; }
+  #status .state.off { color: #666; }
+  #status .error { color: #c62828; }
+
+  /* 開始・終了ボタン */
+  #controls {
+    position: absolute; z-index: 1000; left: 50%; transform: translateX(-50%);
+    bottom: calc(24px + env(safe-area-inset-bottom));
+    display: flex; gap: 20px;
+  }
+  .img-btn {
+    width: 84px; height: 84px; padding: 6px; border: none; border-radius: 50%;
+    background: #fff; box-shadow: 0 4px 14px rgba(0,0,0,0.25); cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+  }
+  .img-btn img { width: 54px; height: 54px; pointer-events: none; }
+  .img-btn span { font-size: 11px; color: #333; font-weight: bold; margin-top: -2px; }
+  .img-btn:active { transform: scale(0.95); }
+  .img-btn:disabled { opacity: 0.4; cursor: default; box-shadow: 0 2px 6px rgba(0,0,0,0.15); }
+
+  /* ポイントのラベル（未読み上げ: 赤 / 読み上げ済み: 青） */
+  .poi-icon { position: relative; }
+  .poi-dot {
+    position: absolute; left: 0; top: 0; width: 12px; height: 12px; border-radius: 50%;
+    border: 2px solid #fff; box-sizing: border-box; box-shadow: 0 0 2px rgba(0,0,0,0.6);
+  }
+  .poi-label {
+    position: absolute; left: 6px; bottom: 10px; transform: translateX(-50%);
+    white-space: nowrap; font-size: 13px; font-weight: bold;
+    text-shadow: -1px -1px 0 #fff, 1px -1px 0 #fff, -1px 1px 0 #fff, 1px 1px 0 #fff, 0 0 3px #fff;
+  }
+  .poi-pending .poi-dot, .poi-queued .poi-dot, .poi-speaking .poi-dot { background: #e53935; }
+  .poi-pending .poi-label, .poi-queued .poi-label, .poi-speaking .poi-label { color: #e53935; }
+  .poi-done .poi-dot { background: #1e5bd8; }
+  .poi-done .poi-label { color: #1e5bd8; }
+  .poi-speaking .poi-label { animation: blink 0.8s ease-in-out infinite alternate; }
+  @keyframes blink { from { opacity: 1; } to { opacity: 0.45; } }
+
+  /* 現在地 */
+  .me-dot {
+    width: 16px; height: 16px; border-radius: 50%; background: #1a73e8; border: 3px solid #fff;
+    box-sizing: border-box; box-shadow: 0 0 6px rgba(26,115,232,0.8);
+  }
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="status">
+  <div>状態：<span id="state" class="state off">停止中</span></div>
+  <div id="info">ポイントを読み込み中…</div>
+</div>
+
+<div id="controls">
+  <button id="start-btn" class="img-btn" type="button" aria-label="ジオフェンシング開始">
+    <img src="geofenceon.png" alt=""><span>開始</span>
+  </button>
+  <button id="stop-btn" class="img-btn" type="button" aria-label="ジオフェンシング終了" disabled>
+    <img src="geofenceoff.png" alt=""><span>終了</span>
+  </button>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  // ===== 設定 =====
+  const GEOJSON_URL = 'data/geofence.geojson';
+  const TRIGGER_DISTANCE_M = 20;     // ポイントの何m手前で発音するか
+  const GAP_AFTER_CHIME_MS = 1000;   // チャイム後、読み上げまでの間隔
+  const RETRY_AFTER_ERROR_MS = 10000;// 読み上げ失敗時の再試行待ち
+  const FOLLOW_PAUSE_MS = 10000;     // 地図を手で動かした後、追従を止める時間
+  // ?sim=1 を付けると、地図クリックを現在地として扱うテストモード
+  const SIM_MODE = new URLSearchParams(location.search).has('sim');
+
+  // ===== 画面要素 =====
+  const startBtn = document.getElementById('start-btn');
+  const stopBtn = document.getElementById('stop-btn');
+  const stateEl = document.getElementById('state');
+  const infoEl = document.getElementById('info');
+
+  // ===== 状態 =====
+  let points = [];          // { title, latlng, marker, status: pending|queued|speaking|done, retryAfter }
+  let isRunning = false;
+  let watchId = null;
+  let sessionId = 0;        // 終了時にインクリメントし、実行中の非同期処理を無効化
+  let queue = [];
+  let processing = false;
+  let startupSpeech = Promise.resolve();
+  let meMarker = null, meAccuracy = null;
+  let firstFix = true;
+  let followPausedUntil = 0;
+  let wakeLock = null;
+
+  // ===== 地図 =====
+  const map = L.map('map', { zoomControl: false }).setView([34.70, 135.50], 13);
+  L.control.zoom({ position: 'bottomright' }).addTo(map);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+  map.on('dragstart', () => { followPausedUntil = Date.now() + FOLLOW_PAUSE_MS; });
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function makeIcon(p) {
+    return L.divIcon({
+      className: 'poi-icon poi-' + p.status,
+      html: '<span class="poi-dot"></span><span class="poi-label">' + escapeHtml(p.title) + '</span>',
+      iconSize: [12, 12],
+      iconAnchor: [6, 6]
+    });
+  }
+
+  function setStatus(p, status) {
+    p.status = status;
+    p.marker.setIcon(makeIcon(p));
+  }
+
+  // (4) GeoJSON の読み込みと表示
+  async function loadPoints() {
+    try {
+      const res = await fetch(GEOJSON_URL, { cache: 'no-cache' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const geo = await res.json();
+      const feats = (geo.features || []).filter(f => f.geometry && f.geometry.type === 'Point');
+      points = feats.map((f, i) => {
+        const pr = f.properties || {};
+        const [lng, lat] = f.geometry.coordinates;
+        const p = {
+          title: pr['タイトル'] || pr.title || pr.name || ('ポイント' + (i + 1)),
+          latlng: L.latLng(lat, lng),
+          status: 'pending',
+          retryAfter: 0
+        };
+        p.marker = L.marker(p.latlng, { icon: makeIcon(p), keyboard: false }).addTo(map);
+        L.circle(p.latlng, { radius: TRIGGER_DISTANCE_M, color: '#e53935', weight: 1, dashArray: '4 4', fillOpacity: 0.06, interactive: false }).addTo(map);
+        return p;
+      });
+      if (points.length) map.fitBounds(L.latLngBounds(points.map(p => p.latlng)), { padding: [40, 40] });
+      infoEl.textContent = points.length + ' 件のポイントを読み込みました。' + (SIM_MODE ? '（テストモード：開始後に地図をクリックすると現在地になります）' : '');
+    } catch (e) {
+      console.error(e);
+      infoEl.innerHTML = '<span class="error">' + escapeHtml(GEOJSON_URL) + ' を読み込めませんでした。' +
+        'HTTP(S) サーバー経由で開いてください（file:// では読み込めません）。</span>';
+    }
+  }
+
+  // ===== 音声（Web Audio） =====
+  // iOS では AudioContext を毎回作ると上限に達する／ユーザー操作外では鳴らないため、
+  // 開始ボタン押下時に1つだけ作成・アンロックして使い回す。
+  let audioCtx = null;
+  function getAudioContext() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) audioCtx = new AC();
+    }
+    return audioCtx;
+  }
+
+  function unlockAudio() {
+    // iOS 17+ Safari: マナーモードでも鳴るように再生カテゴリを指定
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+    const ctx = getAudioContext();
+    if (!ctx) return;
+    if (ctx.state !== 'running') ctx.resume().catch(() => {});
+    // 無音バッファを再生してアンロック（iOS Safari 対策）
+    const buf = ctx.createBuffer(1, 1, 22050);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start(0);
+  }
+
+  // (8) sample.html の playChime を参考にしたピンポーン音
+  async function playChime() {
+    const ctx = getAudioContext();
+    if (!ctx) return;
+    if (ctx.state !== 'running') { try { await ctx.resume(); } catch (e) {} }
+    const notes = [
+      { freq: 659.25, start: 0,   duration: 0.5 }, // ミ
+      { freq: 523.25, start: 0.4, duration: 0.8 }  // ド
+    ];
+    const t0 = ctx.currentTime + 0.05;
+    let end = 0;
+    notes.forEach(note => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(note.freq, t0 + note.start);
+      gain.gain.setValueAtTime(0, t0 + note.start);
+      gain.gain.linearRampToValueAtTime(0.2, t0 + note.start + 0.05);
+      gain.gain.exponentialRampToValueAtTime(0.001, t0 + note.start + note.duration);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t0 + note.start);
+      osc.stop(t0 + note.start + note.duration);
+      end = Math.max(end, note.start + note.duration);
+    });
+    await sleep((end + 0.05) * 1000);
+  }
+
+  // ===== 音声読み上げ（Web Speech API） =====
+  const synth = window.speechSynthesis || null;
+  let jaVoice = null;
+  const liveUtterances = new Set(); // Chrome で onend 前に GC されるのを防ぐ
+
+  function pickVoice() {
+    if (!synth) return;
+    const vs = synth.getVoices() || [];
+    jaVoice = vs.find(v => /^ja([-_]|$)/i.test(v.lang) && v.localService) ||
+              vs.find(v => /^ja/i.test(v.lang)) || null;
+  }
+  if (synth) {
+    pickVoice();
+    if (typeof synth.addEventListener === 'function') synth.addEventListener('voiceschanged', pickVoice);
+    else synth.onvoiceschanged = pickVoice;
+  }
+
+  // 読み上げ完了で true、失敗で false を返す
+  function speak(text) {
+    return new Promise(resolve => {
+      if (!synth || typeof SpeechSynthesisUtterance === 'undefined') { resolve(false); return; }
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'ja-JP';
+      if (jaVoice) u.voice = jaVoice;
+      u.rate = 1.0;
+      u.pitch = 1.0;
+      u.volume = 1.0;
+      liveUtterances.add(u);
+
+      let done = false, started = false, sawSpeaking = false;
+      let poll = null, timer = null;
+      const t0 = Date.now();
+      const finish = ok => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        clearInterval(poll);
+        liveUtterances.delete(u);
+        resolve(ok);
+      };
+      u.onstart = () => { started = true; };
+      u.onend = () => finish(true);
+      u.onerror = e => { console.warn('speech error:', e.error); finish(false); };
+
+      // 一部の Android / Firefox では onend が発火しないことがあるため、状態監視で補完
+      poll = setInterval(() => {
+        if (synth.speaking) sawSpeaking = true;
+        else if ((started || sawSpeaking) && !synth.pending && Date.now() - t0 > 800) finish(true);
+      }, 250);
+      timer = setTimeout(() => finish(started || sawSpeaking), 8000 + text.length * 400);
+
+      if (synth.paused) synth.resume(); // Chrome で一時停止状態のまま固まる対策
+      synth.speak(u);
+    });
+  }
+
+  // ===== 接近時の処理キュー =====
+  async function processQueue() {
+    if (processing) return;
+    processing = true;
+    const sid = sessionId;
+    await startupSpeech;
+    while (queue.length && sid === sessionId) {
+      const p = queue.shift();
+      setStatus(p, 'speaking');
+      await playChime();                       // (8) チャイム
+      if (sid !== sessionId) return;
+      await sleep(GAP_AFTER_CHIME_MS);         // (9) 1秒あける
+      if (sid !== sessionId) return;
+      const ok = await speak(p.title);         // (9) タイトル読み上げ
+      if (sid !== sessionId) return;
+      if (ok) {
+        setStatus(p, 'done');                  // (10) 青色に変更／(11) 以後は再読み上げしない
+      } else {
+        p.retryAfter = Date.now() + RETRY_AFTER_ERROR_MS;
+        setStatus(p, 'pending');
+      }
+    }
+    if (sid === sessionId) processing = false;
+  }
+
+  // ===== 位置情報 =====
+  function onPosition(lat, lng, accuracy) {
+    if (!isRunning) return;
+    const here = L.latLng(lat, lng);
+
+    // 現在地マーカー
+    if (!meMarker) {
+      meMarker = L.marker(here, { icon: L.divIcon({ className: '', html: '<div class="me-dot"></div>', iconSize: [16, 16], iconAnchor: [8, 8] }), zIndexOffset: 1000, interactive: false }).addTo(map);
+      meAccuracy = L.circle(here, { radius: accuracy || 0, color: '#1a73e8', weight: 1, fillOpacity: 0.1, interactive: false }).addTo(map);
+    } else {
+      meMarker.setLatLng(here);
+      meAccuracy.setLatLng(here).setRadius(accuracy || 0);
+    }
+
+    // (6) 現在位置に地図を移動
+    if (firstFix) {
+      map.setView(here, Math.max(map.getZoom(), 18));
+      firstFix = false;
+    } else if (Date.now() >= followPausedUntil) {
+      map.panTo(here, { animate: true });
+    }
+
+    // (7) 接近判定
+    const now = Date.now();
+    let nearest = null;
+    const hits = [];
+    points.forEach(p => {
+      const d = here.distanceTo(p.latlng);
+      if (p.status !== 'done' && (!nearest || d < nearest.d)) nearest = { p, d };
+      if (p.status === 'pending' && now >= p.retryAfter && d <= TRIGGER_DISTANCE_M) hits.push({ p, d });
+    });
+    hits.sort((a, b) => a.d - b.d).forEach(h => { setStatus(h.p, 'queued'); queue.push(h.p); });
+    if (hits.length) processQueue();
+
+    const doneCount = points.filter(p => p.status === 'done').length;
+    infoEl.textContent =
+      '精度 ±' + Math.round(accuracy || 0) + 'm ／ 読み上げ済み ' + doneCount + '/' + points.length +
+      (nearest ? ' ／ 最寄り「' + nearest.p.title + '」まで ' + Math.round(nearest.d) + 'm' : '');
+  }
+
+  function onGeoError(err) {
+    const msg = {
+      1: '位置情報の利用が許可されていません。ブラウザ／端末の設定で許可してください。',
+      2: '位置情報を取得できません（電波状況を確認してください）。',
+      3: '位置情報の取得がタイムアウトしました。再試行中…'
+    }[err.code] || ('位置情報エラー: ' + err.message);
+    infoEl.innerHTML = '<span class="error">' + escapeHtml(msg) + '</span>';
+    if (err.code === 1) stop(true);
+  }
+
+  // ===== 画面ロック防止（バックグラウンドでは位置取得・音声が止まるため） =====
+  async function requestWakeLock() {
+    try {
+      if ('wakeLock' in navigator && document.visibilityState === 'visible') {
+        wakeLock = await navigator.wakeLock.request('screen');
+      }
+    } catch (e) { /* 非対応・拒否は無視 */ }
+  }
+  function releaseWakeLock() {
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && isRunning) {
+      if (audioCtx && audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
+      requestWakeLock();
+    }
+  });
+
+  // ===== 開始／終了 =====
+  function updateUi() {
+    startBtn.disabled = isRunning;
+    stopBtn.disabled = !isRunning;
+    stateEl.textContent = isRunning ? 'ジオフェンシング実行中' : '停止中';
+    stateEl.className = 'state ' + (isRunning ? 'on' : 'off');
+  }
+
+  // (5) 開始ボタン
+  function start() {
+    if (isRunning) return;
+    if (!SIM_MODE && !('geolocation' in navigator)) {
+      infoEl.innerHTML = '<span class="error">このブラウザは位置情報に対応していません。</span>';
+      return;
+    }
+    if (!SIM_MODE && !window.isSecureContext) {
+      infoEl.innerHTML = '<span class="error">位置情報は HTTPS（または localhost）でのみ利用できます。</span>';
+      return;
+    }
+
+    // ---- ここから下は「クリック処理の中で同期的に」実行する必要がある（モバイルの自動再生制限対策） ----
+    unlockAudio();
+    if (synth) {
+      synth.cancel();  // Android Chrome で前回の発話が残って固まるのを防ぐ
+      startupSpeech = speak('ジオフェンシングを開始します');  // 読み上げのアンロックを兼ねる
+    } else {
+      startupSpeech = Promise.resolve();
+      infoEl.innerHTML = '<span class="error">このブラウザは音声読み上げに対応していません。</span>';
+    }
+    // ----
+
+    isRunning = true;
+    firstFix = true;
+    followPausedUntil = 0;
+    updateUi();
+    requestWakeLock();
+
+    if (SIM_MODE) {
+      infoEl.textContent = 'テストモード：地図をクリックすると、その地点を現在地として判定します。';
+    } else {
+      infoEl.textContent = '位置情報を取得中…';
+      watchId = navigator.geolocation.watchPosition(
+        pos => onPosition(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy),
+        onGeoError,
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 }
+      );
+    }
+  }
+
+  // (12) 終了ボタン：読み上げ状態を初期化し、タイトルを全て赤に戻す
+  function stop(keepMessage) {
+    if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+    isRunning = false;
+    sessionId++;
+    queue = [];
+    processing = false;
+    if (synth) synth.cancel();
+    points.forEach(p => { p.retryAfter = 0; setStatus(p, 'pending'); });
+    if (meMarker) { map.removeLayer(meMarker); map.removeLayer(meAccuracy); meMarker = meAccuracy = null; }
+    releaseWakeLock();
+    updateUi();
+    if (keepMessage !== true) infoEl.textContent = '終了しました。読み上げ状態を初期化しました（' + points.length + ' 件）。';
+  }
+
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', () => stop());
+  if (SIM_MODE) map.on('click', e => onPosition(e.latlng.lat, e.latlng.lng, 5));
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  updateUi();
+  loadPoints();
+})();
+</script>
+</body>
+</html>
