@@ -41,7 +41,8 @@
   .img-btn:disabled { opacity: 0.4; cursor: default; box-shadow: 0 2px 6px rgba(0,0,0,0.15); }
 
   /* ポイントのラベル（未読み上げ: 赤 / 読み上げ済み: 青） */
-  .poi-icon { position: relative; }
+  /* 注意: position を上書きしないこと（Leaflet のマーカーは position:absolute で配置される） */
+  .poi-icon { background: transparent; border: none; }
   .poi-dot {
     position: absolute; left: 0; top: 0; width: 12px; height: 12px; border-radius: 50%;
     border: 2px solid #fff; box-sizing: border-box; box-shadow: 0 0 2px rgba(0,0,0,0.6);
